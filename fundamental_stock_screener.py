@@ -1,131 +1,116 @@
 import pandas as pd
-import numpy as np
 import yfinance as yf
+from ta.momentum import RSIIndicator
+from ta.trend import SMAIndicator
 
-# Indian stocks to screen
-TICKERS = [
-    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
-    "ITC.NS", "SBIN.NS", "LTIM.NS", "AXISBANK.NS", "KOTAKBANK.NS",
-    "BAJFINANCE.NS", "ASIANPAINT.NS", "SUNPHARMA.NS", "WIPRO.NS",
-    "TATACONSUM.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS"
-]
+from stock_config import load_tickers
+
+NSE_TICKERS = load_tickers()
 
 
-def safe_float(value):
+def fetch_stock_data(ticker: str) -> pd.DataFrame:
+    """Download recent 1-year daily data for a stock."""
     try:
-        if value is None:
-            return np.nan
-        return float(value)
+        df = yf.download(
+            ticker,
+            period="1y",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+        )
+        if df.empty:
+            return pd.DataFrame()
+
+        df = df.reset_index()
+        if "Date" in df.columns:
+            df = df.rename(columns={"Date": "date"})
+
+        if "Close" in df.columns:
+            df["close"] = df["Close"]
+        if "Volume" in df.columns:
+            df["volume"] = df["Volume"]
+
+        return df[["date", "close", "volume"]].dropna().reset_index(drop=True)
     except Exception:
-        return np.nan
+        return pd.DataFrame()
 
 
-def get_latest_financials(ticker):
-    t = yf.Ticker(ticker)
-    info = t.info
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add moving average, RSI, and volume-based metrics."""
+    if df.empty:
+        return df
 
-    pe = safe_float(info.get("trailingPE"))
-    roe = safe_float(info.get("returnOnEquity")) / 100.0
-    profit_margin = safe_float(info.get("profitMargins"))
-    debt_to_equity = safe_float(info.get("debtToEquity"))
-    current_ratio = safe_float(info.get("currentRatio"))
-    market_cap = safe_float(info.get("marketCap"))
-
-    rev_df = t.financials.loc["Total Revenue"] if "Total Revenue" in t.financials.index else pd.Series(dtype=float)
-    net_income_df = t.financials.loc["Net Income"] if "Net Income" in t.financials.index else pd.Series(dtype=float)
-
-    if not rev_df.empty:
-        rev_df = rev_df.dropna().sort_index()
-    if not net_income_df.empty:
-        net_income_df = net_income_df.dropna().sort_index()
-
-    revenue_cagr = np.nan
-    if len(rev_df) >= 2:
-        years = list(rev_df.index)
-        try:
-            latest_rev = float(rev_df.iloc[-1])
-            old_rev = float(rev_df.iloc[-3]) if len(rev_df) >= 3 else float(rev_df.iloc[0])
-            if old_rev > 0 and latest_rev > 0:
-                revenue_cagr = (latest_rev / old_rev) ** (1 / max(1, min(3, len(rev_df) - 1))) - 1
-        except Exception:
-            pass
-
-    avg_net_margin = np.nan
-    if not net_income_df.empty and not rev_df.empty:
-        try:
-            avg_margin = 0
-            count = 0
-            for idx in range(len(net_income_df)):
-                if idx < len(rev_df):
-                    ni = float(net_income_df.iloc[idx])
-                    rev = float(rev_df.iloc[idx])
-                    if rev > 0:
-                        avg_margin += ni / rev
-                        count += 1
-            if count > 0:
-                avg_net_margin = avg_margin / count
-        except Exception:
-            pass
-
-    return {
-        "ticker": ticker,
-        "pe": pe,
-        "roe": roe,
-        "profit_margin": profit_margin,
-        "debt_to_equity": debt_to_equity,
-        "current_ratio": current_ratio,
-        "revenue_cagr_3y": revenue_cagr,
-        "avg_net_margin": avg_net_margin,
-        "market_cap": market_cap,
-    }
+    df = df.copy()
+    df["sma20"] = SMAIndicator(df["close"], window=20).sma_indicator()
+    df["sma50"] = SMAIndicator(df["close"], window=50).sma_indicator()
+    df["rsi14"] = RSIIndicator(df["close"], window=14).rsi()
+    df["avg_vol_20"] = df["volume"].rolling(window=20).mean()
+    df["year_high"] = df["close"].rolling(window=252, min_periods=1).max()
+    return df
 
 
-def is_fundamentally_good(data):
-    if pd.isna(data["pe"]) or pd.isna(data["roe"]) or pd.isna(data["profit_margin"]):
+def is_bullish_signal(row: pd.Series) -> bool:
+    """Return True if the latest stock data matches a bullish setup."""
+    price = row["close"]
+    sma20 = row["sma20"]
+    sma50 = row["sma50"]
+    rsi = row["rsi14"]
+    volume = row["volume"]
+    avg_vol = row["avg_vol_20"]
+    year_high = row["year_high"]
+
+    if pd.isna(price) or pd.isna(sma20) or pd.isna(sma50) or pd.isna(rsi):
         return False
 
     return (
-        (data["pe"] > 0 and data["pe"] < 25)
-        and (data["roe"] > 0.15)
-        and (data["profit_margin"] > 0.10)
-        and (data["current_ratio"] > 1.2)
-        and (data["debt_to_equity"] < 1.0 or pd.isna(data["debt_to_equity"]))
-        and (pd.isna(data["revenue_cagr_3y"]) or data["revenue_cagr_3y"] > 0.08)
-        and (pd.isna(data["avg_net_margin"]) or data["avg_net_margin"] > 0.08)
+        price > sma20
+        and sma20 > sma50
+        and 50 <= rsi <= 75
+        and volume > 1.5 * avg_vol
+        and price >= 0.9 * year_high
     )
 
 
-def screen_fundamental_stocks():
+def scan_stocks() -> pd.DataFrame:
     results = []
-    for ticker in TICKERS:
-        try:
-            data = get_latest_financials(ticker)
-            if is_fundamentally_good(data):
-                results.append(data)
-        except Exception:
-            pass
 
-    df = pd.DataFrame(results)
-    if df.empty:
-        print("No fundamentally strong stocks found with the current criteria.")
-        return
+    for ticker in NSE_TICKERS:
+        df = fetch_stock_data(ticker)
+        if df.empty:
+            continue
 
-    df = df.sort_values(["roe", "pe"], ascending=[False, True]).reset_index(drop=True)
-    print(
-        df[
-            [
-                "ticker",
-                "pe",
-                "roe",
-                "profit_margin",
-                "current_ratio",
-                "debt_to_equity",
-                "revenue_cagr_3y",
-                "market_cap",
-            ]
-        ].to_string(index=False)
-    )
+        df = add_indicators(df)
+        latest = df.dropna(subset=["sma20", "sma50", "rsi14", "avg_vol_20"]).tail(1)
+        if latest.empty:
+            continue
+
+        row = latest.iloc[0]
+        if is_bullish_signal(row):
+            results.append(
+                {
+                    "ticker": ticker,
+                    "price": round(float(row["close"]), 2),
+                    "sma20": round(float(row["sma20"]), 2),
+                    "sma50": round(float(row["sma50"]), 2),
+                    "rsi14": round(float(row["rsi14"]), 2),
+                    "volume": int(row["volume"]),
+                    "avg_vol_20": round(float(row["avg_vol_20"]), 2),
+                    "year_high": round(float(row["year_high"]), 2),
+                }
+            )
+
+    if not results:
+        print("No stocks match the current scanner conditions.")
+        return pd.DataFrame()
+
+    return pd.DataFrame(results).sort_values("rsi14", ascending=False)
 
 
 if __name__ == "__main__":
-    screen_fundamental_stocks()
+    pd.set_option("display.max_columns", None)
+    results = scan_stocks()
+    if not results.empty:
+        print(results.to_string(index=False))
+        # Optional: save to CSV
+        # results.to_csv("indian_stock_scan.csv", index=False)
