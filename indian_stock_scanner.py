@@ -29,7 +29,6 @@ def fetch_stock_data(ticker: str) -> pd.DataFrame:
         if "Date" in df.columns:
             df = df.rename(columns={"Date": "date"})
 
-        # Standardize common columns
         if "Close" in df.columns:
             df["close"] = df["Close"]
         if "Volume" in df.columns:
